@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm import envs
 from vllm.entrypoints.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
@@ -82,6 +83,10 @@ class ParserEngine(Parser):
     Subclasses set the ``ParserEngineConfig`` in ``__init__`` to define the
     complete output format for a model (reasoning + tool calls).
     """
+
+    # xgrammar structural-tag model key; set by ParserManager.get_parser
+    # when a shared engine stands in for DelegatingParser.
+    structural_tag_model: str | None = None
 
     def __init__(
         self,
@@ -205,7 +210,30 @@ class ParserEngine(Parser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
-        return request
+        # No separate tool parser on a shared engine: apply the tag here.
+        return self._apply_structural_tag(request)
+
+    def get_structural_tag(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        *,
+        reasoning: bool = False,
+    ):
+        """Mirror of ``ToolParser.get_structural_tag`` for shared engines."""
+        if self.structural_tag_model is None:
+            return None
+        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
+            return None
+        from vllm.tool_parsers.structural_tag_registry import (
+            get_model_structural_tag,
+        )
+
+        return get_model_structural_tag(
+            model=self.structural_tag_model,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            reasoning=reasoning,
+        )
 
     def _preprocess_feed(
         self,

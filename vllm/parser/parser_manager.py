@@ -140,6 +140,19 @@ class ParserManager:
         reasoning_engine_cls = cls._get_parser_engine_cls(reasoning_parser_cls)
         tool_engine_cls = cls._get_parser_engine_cls(tool_parser_cls)
         if reasoning_engine_cls is not None and reasoning_engine_cls is tool_engine_cls:
+            # The shared engine replaces DelegatingParser and must carry the
+            # tool adapter's tag declaration, or tool_choice/strict tools are
+            # silently unenforced.
+            tag_model = getattr(tool_parser_cls, "structural_tag_model", None)
+            if (
+                tag_model is not None
+                and reasoning_engine_cls.structural_tag_model != tag_model
+            ):
+                return type(
+                    reasoning_engine_cls.__name__,
+                    (reasoning_engine_cls,),
+                    {"structural_tag_model": tag_model},
+                )
             return reasoning_engine_cls
 
         if reasoning_parser_name == "kimi_k3" or tool_parser_name == "kimi_k3":
