@@ -95,6 +95,9 @@ def _split(
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0 and not use_eagle
         ),
+        # Mirrors Scheduler.__init__: the eagle drop shifts the reachable
+        # partial-tail boundary one hash unit down.
+        mamba_tail_eagle_shift=(ATTN_BLOCK_SIZE if partial_hit and use_eagle else 0),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
@@ -265,7 +268,12 @@ def test_unaligned_resume_never_runs_past_its_block(
     """
     prompt_len = 3602
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    tail_boundary = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    # The reachable partial-tail boundary is (n-1)-floored (the finder caps at
+    # n - 1) and eagle-shifted one hash unit down — see the boundary invariant
+    # in Scheduler.__init__.
+    tail_boundary = (prompt_len - 1) // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE - (
+        ATTN_BLOCK_SIZE if partial_hit and use_eagle else 0
+    )
 
     pos, ends = resume_at, []
     while pos < prompt_len:
@@ -294,3 +302,50 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+@pytest.mark.parametrize(
+    ("prompt_len", "use_eagle", "partial_hit", "expected_ends"),
+    [
+        # Block-aligned prompt, no eagle: deliberate stop at the (n-1)-floored
+        # block boundary. The n-based floor put it at 4800 — a position the
+        # finder (capped at n - 1 = 4799) can never request.
+        (3 * MAMBA_BLOCK_SIZE, False, False, [3200, 4800]),
+        # Block-aligned prompt with eagle: one further block back.
+        (3 * MAMBA_BLOCK_SIZE, True, False, [1600, 4800]),
+        # Two aligned blocks with eagle: nothing cacheable mid-prefill; a
+        # single terminal chunk (the terminal chunk is exempt from the rule —
+        # decode advances its slot to the boundary).
+        (2 * MAMBA_BLOCK_SIZE, True, False, [3200]),
+        # Fine-grained partial tail with eagle: the tail stop is the
+        # (n-1)-floored hash boundary minus the eagle shift (3584, not 3600).
+        (3602, True, True, [1600, 3584, 3602]),
+        # Hash-aligned prompt: tail stop coincides with a block boundary.
+        (2 * MAMBA_BLOCK_SIZE + 2 * ATTN_BLOCK_SIZE, True, True, [1600, 3200, 3232]),
+    ],
+)
+def test_deliberate_stops_land_on_reachable_boundaries(
+    prompt_len: int,
+    use_eagle: bool,
+    partial_hit: bool,
+    expected_ends: list[int],
+) -> None:
+    """Every deliberate (non-terminal) chunk end must be a position the
+    prefix-cache finder can request: floored from n - 1 and eagle-shifted
+    where a shift applies. n-based flooring violated this exactly for aligned
+    lengths, registering state one unit above any reachable position — hits
+    then reconciled to zero (the fixed bug)."""
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    pos, ends = 0, []
+    while pos < prompt_len:
+        request.num_computed_tokens = pos
+        num_new = _split(
+            request, prompt_len - pos, use_eagle=use_eagle, partial_hit=partial_hit
+        )
+        assert num_new > 0
+        pos += num_new
+        ends.append(pos)
+    assert ends == expected_ends
+    # Property: every non-terminal end is reachable by the finder.
+    for end in ends[:-1]:
+        assert end <= prompt_len - 1
