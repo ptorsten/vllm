@@ -38,6 +38,19 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def retention_grid_block(
+    block_idx: int, retention_interval: int | None, block_size: int
+) -> bool:
+    """Whether block ``block_idx``, holding state for the first
+    ``(block_idx + 1) * block_size`` tokens, ends on a retention-grid boundary.
+    Shared by the retention mask (what to register) and the align allocator
+    (what to keep in place)."""
+    if not retention_interval:
+        return False
+    per_segment = retention_interval // block_size
+    return per_segment > 1 and (block_idx + 1) % per_segment == 0
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -57,6 +70,7 @@ class SingleTypeKVCacheManager(ABC):
         pcp_world_size: int = 1,
         needs_kv_cache_zeroing: bool = False,
         max_admission_blocks_per_request: int | None = None,
+        retention_interval: int | None = None,
     ) -> None:
         """
         Initializes the SingleTypeKVCacheManager.
@@ -79,6 +93,9 @@ class SingleTypeKVCacheManager(ABC):
         # Hybrid fine-grained lookup may lower this after all participating
         # managers have been validated by the coordinator.
         self.cache_hit_alignment_tokens = scheduler_block_size
+        # None = dense, 0 = replay boundary only, > 0 = one checkpoint per
+        # interval.
+        self.retention_interval = retention_interval
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -617,6 +634,10 @@ class SingleTypeKVCacheManager(ABC):
 
         raise NotImplementedError
 
+    def _keep_skipped_block(self, block_idx: int) -> bool:
+        """Whether ``_remove_blocks_in_range`` leaves ``block_idx`` in place."""
+        return False
+
     def _remove_blocks_in_range(
         self,
         request_id: str,
@@ -626,7 +647,9 @@ class SingleTypeKVCacheManager(ABC):
         """Free blocks in ``[first_block, last_block)`` and replace with null_block.
 
         Iterates backward so newly-evictable tail blocks are reached even after
-        earlier blocks in the range were nulled in a prior call.
+        earlier blocks in the range were nulled in a prior call. Blocks the
+        manager keeps (``_keep_skipped_block``) stay in place and the sweep
+        continues past them.
         """
         if request_id not in self.req_to_blocks:
             return
@@ -639,6 +662,8 @@ class SingleTypeKVCacheManager(ABC):
         for i in range(last_block - 1, first_block - 1, -1):
             if blocks[i] == self._null_block:
                 break
+            if self._keep_skipped_block(i):
+                continue
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
@@ -1409,6 +1434,8 @@ class MambaManager(SingleTypeKVCacheManager):
             # Number of internal checkpoint blocks required by each request's
             # current allocation.
             self._num_checkpoint_blocks: dict[str, int] = {}
+            # Newest registered rolling decode-end checkpoint per request.
+            self._rolling_registered: dict[str, int] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1531,15 +1558,12 @@ class MambaManager(SingleTypeKVCacheManager):
         # ``(i + 1) * block_size``.
         segment_tokens = None if retention_interval == 0 else retention_interval
         if segment_tokens is not None:
-            per_segment = segment_tokens // block_size
-            if per_segment <= 1:
+            if segment_tokens // block_size <= 1:
                 # Interval at/below the block size: every block is a boundary.
                 return None
-            first_boundary = (
-                start_block + per_segment
-            ) // per_segment * per_segment - 1
-            for i in range(first_boundary - start_block, len(mask), per_segment):
-                mask[i] = True
+            for i in range(start_block, end_block):
+                if retention_grid_block(i, segment_tokens, block_size):
+                    mask[i - start_block] = True
 
         # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
         # capped by ``get_computed_blocks``) and any shared-prefix junction, both
@@ -1577,6 +1601,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 last_state_block_idx is not None
                 and last_state_block_idx
                 < cdiv(processed_computed_tokens, self.block_size) - 1
+                and not self._retention_on_grid(last_state_block_idx)
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
@@ -1605,6 +1630,81 @@ class MambaManager(SingleTypeKVCacheManager):
             and checkpoint_idx >= 0
             and (checkpoint_idx >= len(blocks) or blocks[checkpoint_idx].is_null)
         )
+
+    def _num_rolling_spares(self, request_id: str, num_tokens: int) -> int:
+        """Hash-carrying blocks the next allocation's relocation loop keeps in
+        place, so admission asks for as many blocks as allocation consumes."""
+        if not self.retention_interval or request_id not in self._allocated_block_reqs:
+            return 0
+        req_blocks = self.req_to_blocks[request_id]
+        prev_block_len = len(req_blocks)
+        num_skipped_blocks = cdiv(num_tokens, self.block_size) - 1
+        return sum(
+            1
+            for block_idx in range(
+                max(prev_block_len - self.num_speculative_blocks, 0),
+                min(prev_block_len, num_skipped_blocks),
+            )
+            if (block := req_blocks[block_idx]) != self._null_block
+            and block.block_hash is not None
+            and not self._retention_on_grid(block_idx)
+        )
+
+    def _register_rolling_checkpoint(self, request: Request, num_tokens: int) -> None:
+        """Register block ``num_tokens // block_size - 1``, the newest frozen
+        boundary state, as a resume point. Grid blocks are registered by the
+        retention mask instead; same-step hits defer through
+        ``cached_blocks_this_step`` like every other registration."""
+        ridx = num_tokens // self.block_size - 1
+        if ridx < 0 or self._rolling_registered.get(request.request_id) == ridx:
+            return
+        if self._retention_on_grid(ridx):
+            # Grid checkpoints are registered by the retention mask.
+            self._rolling_registered[request.request_id] = ridx
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        if ridx >= len(blocks):
+            return
+        block = blocks[ridx]
+        if block.is_null or block.block_hash is not None:
+            return
+        if (
+            len(request.block_hashes) * self.block_pool.hash_block_size
+            < (ridx + 1) * self.block_size
+        ):
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=ridx,
+            num_full_blocks=ridx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=None,
+        )
+        self._rolling_registered[request.request_id] = ridx
+        if block.block_hash is not None:
+            self.cached_blocks_this_step.add(block.block_hash)
+
+    def _retention_on_grid(self, block_idx: int) -> bool:
+        """Whether the align allocator must keep block ``block_idx`` in place
+        for the retention mask to register it (see ``retention_grid_block``)."""
+        return retention_grid_block(block_idx, self.retention_interval, self.block_size)
+
+    def _keep_skipped_block(self, block_idx: int) -> bool:
+        return self._retention_on_grid(block_idx)
+
+    def _num_retention_grid_crossings(
+        self, num_tokens: int, num_computed_tokens: int
+    ) -> int:
+        """Retention-grid boundaries inside this step's token span; each one
+        is a block allocate_new_blocks keeps in place instead of recycling."""
+        interval = self.retention_interval
+        if not interval or interval // self.block_size <= 1:
+            return 0
+        start = max(num_computed_tokens, 0)
+        end = max(num_tokens, start)
+        return max(end // interval - start // interval, 0)
 
     def get_num_blocks_to_allocate(
         self,
@@ -1672,11 +1772,16 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._needs_internal_checkpoint(
                     request_id, num_tokens, total_computed_tokens
                 )
-            )
+            ) + self._num_retention_grid_crossings(num_tokens, total_computed_tokens)
             if not apply_admission_cap:
                 self._num_checkpoint_blocks[request_id] = checkpoint_block
             if num_new_blocks > 0:
-                num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                num_new_blocks = (
+                    1
+                    + int(has_partial_hit)
+                    + checkpoint_block
+                    + self._num_rolling_spares(request_id, num_tokens)
+                )
                 if request_id not in self._allocated_block_reqs:
                     num_new_blocks += self.num_speculative_blocks
 
@@ -1745,19 +1850,33 @@ class MambaManager(SingleTypeKVCacheManager):
                         [self._null_block for _ in range(prev_block_len, null_end)]
                     )
 
+                num_spared_blocks = 0
                 if blocks_allocated:
                     # Relocate exclusively owned speculative scratch blocks.
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks:
+                            block = req_blocks[block_idx]
+                            on_grid = self._retention_on_grid(block_idx)
+                            if block != self._null_block and (
+                                on_grid or block.block_hash is not None
+                            ):
+                                # Checkpoints stay in place: relocation reuses
+                                # the block object and would re-key newer state
+                                # under its hash.
+                                if not on_grid:
+                                    num_spared_blocks += 1
+                                continue
                             self._relocate_speculative_block(req_blocks, block_idx)
                         else:
                             break
                 num_new_blocks = num_required_blocks - len(req_blocks)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
-                max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                max_new_blocks = (
+                    1 + int(has_partial_hit) + checkpoint_block + num_spared_blocks
+                )
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
@@ -1840,6 +1959,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._rolling_registered.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -1873,6 +1993,8 @@ class MambaManager(SingleTypeKVCacheManager):
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+            if self.retention_interval:
+                self._register_rolling_checkpoint(request, num_tokens)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
