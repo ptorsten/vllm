@@ -31,6 +31,16 @@ enum class NVFP4KVScaleSearch {
   FOUR_OVER_SIX,
 };
 
+// The SM100 trtllm-gen MHA kernel consumes V block-scales through the 4x4
+// swizzle below; the SM12x NVFP4 readers (FlashInfer XQA decode and FA2
+// prefill) consume linear V scales, laid out like K.
+// See https://github.com/vllm-project/vllm/issues/50084.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  #define VLLM_NVFP4_KV_SWIZZLE_V_SCALES 0
+#else
+  #define VLLM_NVFP4_KV_SWIZZLE_V_SCALES 1
+#endif
+
 // Compute swizzled scale offset for SM100 trtllm-gen MHA kernel.
 // The swizzle pattern for HND layout is:
 //   [T//4, 4, 4, S//4] → permute(0, 2, 3, 1) → reshape to [T, S]
@@ -281,11 +291,13 @@ __global__ void reshape_and_cache_nvfp4_kernel(
 
       // Write block scale to scale cache.
       // K (kv==0): linear layout (no swizzle).
-      // V (kv==1): swizzled layout for SM100 trtllm-gen MHA kernel.
+      // V (kv==1): swizzled layout for the SM100 trtllm-gen MHA kernel;
+      // linear on SM120/121, whose XQA/FA2 readers expect the K layout.
       if (sf_out_ptr != nullptr) {
+        constexpr bool kSwizzleVScales = VLLM_NVFP4_KV_SWIZZLE_V_SCALES != 0;
         int scale_idx = group_in_head;
         uint8_t* __restrict__ scale_dst;
-        if (kv == 0) {
+        if (kv == 0 || !kSwizzleVScales) {
           scale_dst = scale_block + head * scale_head_stride +
                       block_offset * scale_block_offset_stride + scale_idx;
         } else {
