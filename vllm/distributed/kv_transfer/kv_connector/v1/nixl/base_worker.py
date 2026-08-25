@@ -2664,7 +2664,14 @@ class NixlBaseConnectorWorker:
         block_ids: BlockIds, region_group_ids: list[int]
     ) -> BlockIds:
         """Expand group block IDs into the corresponding region order."""
-        return [list(block_ids[group_id]) for group_id in region_group_ids]
+        shared_block_ids = list(itertools.chain.from_iterable(block_ids))
+        block_ids_by_region = []
+        for group_id in region_group_ids:
+            if group_id == _SHARED_REGION_GROUP_ID:
+                block_ids_by_region.append(shared_block_ids.copy())
+                continue
+            block_ids_by_region.append(list(block_ids[group_id]))
+        return block_ids_by_region
 
     @staticmethod
     def _split_block_ids_by_region(

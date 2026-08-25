@@ -237,6 +237,7 @@ def test_overlaid_transfer_groups_share_region_geometry():
     )
     assert metadata.region_group_ids == [-1]
     assert metadata.region_num_blocks == [num_blocks]
+    assert worker._block_ids_by_region(([0], [2]), worker.region_group_ids) == [[0, 2]]
 
 
 def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blocks):
