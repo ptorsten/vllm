@@ -6,10 +6,12 @@ import random
 import pytest
 import torch
 
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    init_none_hash,
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -19,6 +21,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     RSWAManager,
     SlidingWindowManager,
+    retention_grid_block,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -28,6 +31,8 @@ from vllm.v1.kv_cache_interface import (
     RSWASpec,
     SlidingWindowSpec,
 )
+
+from .test_prefix_caching import make_request
 
 pytestmark = pytest.mark.cpu_test
 
@@ -781,3 +786,133 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+RETENTION_BLOCK = 1600
+RETENTION_INTERVAL = 3 * RETENTION_BLOCK  # grid checkpoints at blocks 2, 5, ...
+
+
+def get_align_mamba_manager(
+    retention_interval: int | None = RETENTION_INTERVAL,
+    num_speculative_blocks: int = 0,
+) -> MambaManager:
+    spec = MambaSpec(
+        block_size=RETENTION_BLOCK,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_speculative_blocks,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=1000, enable_caching=True, hash_block_size=RETENTION_BLOCK
+    )
+    return MambaManager(
+        spec,
+        block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=RETENTION_BLOCK,
+        retention_interval=retention_interval,
+    )
+
+
+def make_aligned_request(request_id: str, num_blocks: int):
+    init_none_hash(sha256)
+    return make_request(
+        request_id=request_id,
+        prompt_token_ids=list(range(num_blocks * RETENTION_BLOCK)),
+        block_size=RETENTION_BLOCK,
+        hash_fn=sha256,
+    )
+
+
+def prefill_aligned(manager: MambaManager, request, num_blocks: int) -> None:
+    """One block-aligned prefill step per block, driven as the scheduler does:
+    admission estimate, allocation, caching, then skipped-block removal."""
+    req_id = request.request_id
+    manager.req_to_blocks[req_id]
+    for step in range(1, num_blocks + 1):
+        num_tokens = step * RETENTION_BLOCK
+        computed = (step - 1) * RETENTION_BLOCK
+        estimate = manager.get_num_blocks_to_allocate(
+            req_id,
+            num_tokens,
+            new_computed_blocks=[],
+            total_computed_tokens=computed,
+            num_local_computed_tokens=computed,
+            num_tokens_main_model=num_tokens,
+        )
+        new = manager.allocate_new_blocks(
+            req_id, num_tokens, num_tokens_main_model=num_tokens
+        )
+        assert len(new) <= estimate, "admission under-estimated allocation"
+        manager.cache_blocks(
+            request, num_tokens, retention_interval=manager.retention_interval
+        )
+        manager.remove_skipped_blocks(req_id, num_tokens)
+
+
+def test_mamba_align_retention_grid_blocks_survive_relocation():
+    manager = get_align_mamba_manager()
+    request = make_aligned_request("req", 6)
+    prefill_aligned(manager, request, 6)
+    blocks = manager.req_to_blocks["req"]
+    null = manager.block_pool.null_block
+    for idx in range(4):  # interior blocks; the running tail is exempt
+        on_grid = retention_grid_block(idx, RETENTION_INTERVAL, RETENTION_BLOCK)
+        assert (blocks[idx] != null) == on_grid, f"block {idx}"
+
+
+def test_mamba_align_admission_counts_grid_crossings():
+    """A step whose span crosses a grid boundary keeps one block in place, so
+    the admission estimate must ask for one more than without a grid."""
+    estimates = []
+    for interval in (RETENTION_INTERVAL, None):
+        manager = get_align_mamba_manager(retention_interval=interval)
+        request = make_aligned_request("req", 2)
+        prefill_aligned(manager, request, 2)
+        estimates.append(
+            manager.get_num_blocks_to_allocate(
+                "req",
+                3 * RETENTION_BLOCK,
+                new_computed_blocks=[],
+                total_computed_tokens=2 * RETENTION_BLOCK,
+                num_local_computed_tokens=2 * RETENTION_BLOCK,
+                num_tokens_main_model=3 * RETENTION_BLOCK,
+            )
+        )
+    assert estimates[0] == estimates[1] + 1
+
+
+def test_mamba_align_rolling_checkpoint_registers_newest_boundary():
+    """The newest frozen non-grid boundary becomes a resume point, so an
+    append-style resubmit re-prefills at most one block, not one interval."""
+    manager = get_align_mamba_manager()
+    request = make_aligned_request("req", 6)
+    prefill_aligned(manager, request, 6)
+
+    assert manager._rolling_registered["req"] == 5
+    newest_non_grid = 5
+    while retention_grid_block(newest_non_grid, RETENTION_INTERVAL, RETENTION_BLOCK):
+        newest_non_grid -= 1
+    assert manager.block_pool.get_cached_block(
+        request.block_hashes[newest_non_grid], [0]
+    )
+
+
+def test_mamba_align_rolling_checkpoint_survives_relocation_with_spec_window():
+    """With a speculative window the relocation loop must keep a hashed block
+    in place: relocation reuses the block object and would re-key newer state
+    under the old hash."""
+    manager = get_align_mamba_manager(num_speculative_blocks=2)
+    request = make_aligned_request("req", 6)
+    prefill_aligned(manager, request, 6)
+
+    blocks = manager.req_to_blocks["req"]
+    registered = manager._rolling_registered["req"]
+    in_table = blocks[registered] != manager.block_pool.null_block and (
+        blocks[registered].block_hash is not None
+    )
+    assert in_table or manager.block_pool.get_cached_block(
+        request.block_hashes[registered], [0]
+    )
