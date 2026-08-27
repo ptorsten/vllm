@@ -86,6 +86,9 @@ def _split(
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        # Set by `Scheduler.__init__` from the mamba group's spec; the equal
+        # geometry of these tests keeps it identical to `cache_config`.
+        mamba_state_block_size=MAMBA_BLOCK_SIZE,
         use_eagle=use_eagle,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
