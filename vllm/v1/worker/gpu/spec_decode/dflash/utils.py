@@ -44,6 +44,19 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
+    # dataclasses.replace() drops init=False fields: the copied cache config
+    # loses any already-resolved kv_cache_layout, and the engine's later
+    # set_kv_cache_layout RPC only reaches the target's config. Mirror the
+    # current value and register the copy so the worker RPC can propagate a
+    # layout resolved after this point.
+    draft_cache = draft_vllm_config.cache_config
+    if draft_cache is not vllm_config.cache_config:
+        draft_cache.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
+        siblings = getattr(vllm_config.cache_config, "_draft_cache_configs", None)
+        if siblings is None:
+            siblings = []
+            vllm_config.cache_config._draft_cache_configs = siblings
+        siblings.append(draft_cache)
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config

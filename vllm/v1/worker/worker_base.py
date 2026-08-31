@@ -112,6 +112,13 @@ class WorkerBase:
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         """Adopt the KV cache layout resolved by the engine core."""
         record_kv_cache_layout(self.vllm_config.cache_config, kv_cache_layout)
+        # Draft models run on copies of the cache config (see
+        # spec_decode/dflash/utils.py); without propagation their first
+        # forward dies in get_resolved_kv_cache_layout during profiling.
+        for draft_cache in getattr(
+            self.vllm_config.cache_config, "_draft_cache_configs", []
+        ):
+            record_kv_cache_layout(draft_cache, kv_cache_layout)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.
