@@ -344,6 +344,16 @@ class Scheduler(SchedulerInterface):
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
+        # Boundary rule for every site registering reusable state: the
+        # finder searches positions <= n - 1 and an eagle drafter shifts
+        # each boundary one hash unit down, so floor from (n - 1), then
+        # shift.
+        spec = self.vllm_config.speculative_config
+        self.mamba_tail_eagle_shift = (
+            self.hash_block_size
+            if (self.mamba_partial_cache_hit and spec is not None and spec.use_eagle())
+            else 0
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -413,7 +423,9 @@ class Scheduler(SchedulerInterface):
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
-        last_cache_position = request.num_tokens - request.num_tokens % block_size
+        last_cache_position = (request.num_tokens - 1) - (
+            (request.num_tokens - 1) % block_size
+        )
         if self.use_eagle:
             last_cache_position = max(last_cache_position - block_size, 0)
 
@@ -439,7 +451,10 @@ class Scheduler(SchedulerInterface):
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            (request.num_prompt_tokens - 1)
+            // self.hash_block_size
+            * self.hash_block_size
+            - self.mamba_tail_eagle_shift
             if self.mamba_partial_cache_hit
             else 0
         )
