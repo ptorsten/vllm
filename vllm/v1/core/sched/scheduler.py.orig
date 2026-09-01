@@ -265,11 +265,6 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
-        # Latest verify-block length requested by the worker's speculator
-        # (DFlash2 lookup adaptive controller). Arrives via ModelRunnerOutput,
-        # i.e. after the next step was already scheduled under async
-        # scheduling, so it takes effect one schedule later.
-        self.worker_num_spec_tokens: int | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1342,10 +1337,6 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
-        elif self.worker_num_spec_tokens is not None:
-            num_spec_tokens_to_schedule = min(
-                max(self.worker_num_spec_tokens, 1), self.num_spec_tokens
-            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1837,12 +1828,6 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
-        # Verify-block length requested by the speculator's adaptive controller
-        # (getattr: an EMPTY_MODEL_RUNNER_OUTPUT copy predating the field, or a
-        # worker without the overlay, must read as "no request").
-        self.worker_num_spec_tokens = getattr(
-            model_runner_output, "next_num_spec_tokens", None
-        )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

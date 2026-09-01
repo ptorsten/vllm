@@ -367,14 +367,6 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
-    # How many draft tokens the speculator asks the scheduler to put up for
-    # verification (None = the configured num_speculative_tokens). Set by the
-    # DFlash2 lookup drafter's adaptive controller under async scheduling,
-    # where the worker cannot truncate the drafts the scheduler already
-    # placeholder-scheduled; consumed by Scheduler.update_from_output, so it
-    # shapes the schedule two steps after the step that produced it.
-    next_num_spec_tokens: int | None = None
-
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
