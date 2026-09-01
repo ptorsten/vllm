@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -18,6 +20,24 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+
+def _drafter_query_block(speculative_config, draft_config) -> int:
+    """Query tokens per request for the drafter's block convolutions.
+
+    Single source of truth with DFlashSpeculator.__init__: lookup off ->
+    the full verify block (bonus + k mask tokens); lookup on -> the block
+    the checkpoint was trained for, unless VLLM_DFLASH2_DRAFT_BLOCK claims
+    positions back."""
+    full = 1 + speculative_config.num_speculative_tokens
+    trained = int(draft_config.get("block_size", 1 << 30))
+    if os.environ.get("VLLM_DFLASH2_LOOKUP", "0") != "1":
+        return full
+    block = min(full, trained)
+    override = int(os.environ.get("VLLM_DFLASH2_DRAFT_BLOCK", "0"))
+    if trained - 1 < override <= speculative_config.num_speculative_tokens:
+        block = 1 + override
+    return block
 
 
 def _grouped_conv(
@@ -132,10 +152,12 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             # longer one (v1/worker/gpu/spec_decode/dflash2/lookup.py fills the rest from
             # the context), and this convolution resets on the block boundary -- with the
             # wrong size it runs across the boundary between two requests' blocks.
-            block_size=min(
-                1 + speculative_config.num_speculative_tokens,
-                int(draft_config.get("block_size", 1 << 30)),
-            ),
+            # Must mirror DFlashSpeculator's draft_block derivation exactly:
+            # with the lookup off the drafter is asked for the full verify
+            # block (1 + k queries), and a conv block sized to the trained
+            # checkpoint then splits one request's queries across two conv
+            # blocks (stride assert at graph capture).
+            block_size=_drafter_query_block(speculative_config, draft_config),
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(
