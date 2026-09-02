@@ -1970,12 +1970,28 @@ def _draft_groups_aligned(
     for spec, names in by_spec.items():
         block_size = _draft_group_block_size(spec, common_page, granularity)
         if block_size is None:
-            return None
-        logger.info(
-            "Draft KV group (%d layers): block size %d, page-aligned with no padding",
-            len(names),
-            block_size,
-        )
+            # No exact fit: give the drafter its own (smaller) page instead of
+            # padding it -- a padded page disables kernel block splitting.
+            # Mixed page sizes need a block-outermost KV layout (e.g. BLHNC).
+            per_token = max(spec.page_size_bytes // spec.block_size, 1)
+            block_size = (common_page // per_token) // granularity * granularity
+            if block_size < granularity:
+                return None
+            logger.info(
+                "Draft KV group (%d layers): block size %d with its own page "
+                "(%d bytes vs common %d); requires a block-outermost KV layout",
+                len(names),
+                block_size,
+                block_size * per_token,
+                common_page,
+            )
+        else:
+            logger.info(
+                "Draft KV group (%d layers): block size %d, page-aligned with no "
+                "padding",
+                len(names),
+                block_size,
+            )
         out.append(KVCacheGroupSpec(names, replace(spec, block_size=block_size)))
     return out
 
