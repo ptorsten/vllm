@@ -3352,6 +3352,61 @@ def test_mamba_groups_never_flagged_even_when_draft_shares_a_group():
             assert not group.is_eagle_group
 
 
+def _hybrid_specs_with_gqa_draft(draft_shares_target_spec: bool = False):
+    """DFlash-style draft on the standard Attention path, marked
+    non_causal_multi_token_decode like the MLA drafter above. A real DFlash
+    drafter uses sliding-window layers, which keeps it in its own bucket; pass
+    draft_shares_target_spec to make it a full-attention layer that merges into
+    the target's group instead."""
+    if draft_shares_target_spec:
+        draft_spec = new_kv_cache_spec(block_size=64)
+    else:
+        draft_spec = new_sliding_window_spec(block_size=64)
+    return {
+        "target.attn.0": new_kv_cache_spec(block_size=64),
+        "target.attn.1": new_kv_cache_spec(block_size=64),
+        "target.mamba.0": new_mamba_spec(block_size=64, mamba_cache_mode="align"),
+        "target.mamba.1": new_mamba_spec(block_size=64, mamba_cache_mode="align"),
+        "draft.attn.0": replace(draft_spec, non_causal_multi_token_decode=True),
+    }
+
+
+def test_gqa_draft_group_annotated_on_hybrid_general_path():
+    # Before the marker existed on AttentionSpec a GQA drafter was never
+    # identified and every group -- Mamba included -- was treated as draft.
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(), _hybrid_specs_with_gqa_draft()
+    )
+    flagged = [g for g in groups if g.is_eagle_group]
+    assert len(flagged) == 1
+    assert flagged[0].layer_names == ["draft.attn.0"]
+
+
+def test_gqa_draft_sharing_target_group_flags_it_but_never_mamba():
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(),
+        _hybrid_specs_with_gqa_draft(draft_shares_target_spec=True),
+    )
+    for group in groups:
+        if "draft.attn.0" in group.layer_names:
+            assert group.is_eagle_group
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            assert not group.is_eagle_group
+
+
+def test_full_attention_marker_survives_merge():
+    marked = replace(
+        new_kv_cache_spec(block_size=64), non_causal_multi_token_decode=True
+    )
+    plain = new_kv_cache_spec(block_size=64)
+    assert FullAttentionSpec.merge([marked, marked]).non_causal_multi_token_decode
+    assert not FullAttentionSpec.merge([plain, plain]).non_causal_multi_token_decode
+    sw = replace(
+        new_sliding_window_spec(block_size=64), non_causal_multi_token_decode=True
+    )
+    assert SlidingWindowSpec.merge([sw, sw]).non_causal_multi_token_decode
+
+
 def test_draft_group_not_annotated_without_spec_decode():
     # The marker alone must not flag anything; the eagle semantics only apply
     # when a speculative method is actually enabled.
