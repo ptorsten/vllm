@@ -3394,6 +3394,41 @@ def test_gqa_draft_sharing_target_group_flags_it_but_never_mamba():
             assert not group.is_eagle_group
 
 
+def _packing_specs_with_draft(marked: bool):
+    # 16 full-attention + 48 mamba + a 5-layer sliding-window drafter.
+    # Attention and mamba pages differ (block 16 vs 64), which keeps the layout
+    # off the uniform-type shortcut and on the page-size packing path prod uses.
+    specs = {f"target.attn.{i}": new_kv_cache_spec(block_size=16) for i in range(16)}
+    specs |= {
+        f"target.mamba.{i}": new_mamba_spec(block_size=64, mamba_cache_mode="align")
+        for i in range(48)
+    }
+    draft = new_sliding_window_spec(block_size=16)
+    specs |= {
+        f"draft.attn.{i}": replace(draft, non_causal_multi_token_decode=marked)
+        for i in range(5)
+    }
+    return specs
+
+
+def test_identified_draft_layers_do_not_force_layer_padding(caplog_vllm):
+    # Inside the n:1 packing the 5-layer drafter drags group_size to 5 and the
+    # other buckets pad up (16 -> 20, 48 -> 50); an identified drafter is packed
+    # as its own group and the rest packs 16/16/16/16 with no padding.
+    config = _spec_decode_grouping_config()
+    get_kv_cache_groups(config, _packing_specs_with_draft(marked=False))
+    assert "padding layers" in caplog_vllm.text  # the negative control
+    caplog_vllm.clear()
+
+    groups = get_kv_cache_groups(config, _packing_specs_with_draft(marked=True))
+    assert "padding layers" not in caplog_vllm.text
+    draft_groups = [g for g in groups if g.is_eagle_group]
+    assert len(draft_groups) == 1
+    assert sorted(draft_groups[0].layer_names) == [f"draft.attn.{i}" for i in range(5)]
+    sizes = {len(g.layer_names) for g in groups if not g.is_eagle_group}
+    assert len(sizes) == 1, sizes  # every packed group the same size: no padded tail
+
+
 def test_full_attention_marker_survives_merge():
     marked = replace(
         new_kv_cache_spec(block_size=64), non_causal_multi_token_decode=True
