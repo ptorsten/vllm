@@ -254,6 +254,7 @@ class DFlashQwen3Attention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            non_causal_multi_token_decode=True,
             sinks=self.attention_sink_bias,
         )
         self.causal = causal

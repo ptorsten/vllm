@@ -245,6 +245,7 @@ class Attention(nn.Module, AttentionLayerBase):
         mm_prefix_clamp_sliding_window: bool = False,
         attn_backend: type[AttentionBackend] | None = None,
         head_size_v: int | None = None,
+        non_causal_multi_token_decode: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -434,6 +435,7 @@ class Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.attn_type = attn_type
+        self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(
@@ -628,6 +630,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     head_size_v=self.head_size_v,
                     dtype=self.kv_cache_torch_dtype,
                     kv_quant_mode=quant_mode,
+                    non_causal_multi_token_decode=self.non_causal_multi_token_decode,
                     sliding_window=self.sliding_window,
                 )
             ).real_page_size_bytes
@@ -641,6 +644,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
             )
@@ -652,6 +656,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
 
 

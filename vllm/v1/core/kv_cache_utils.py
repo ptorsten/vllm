@@ -1909,6 +1909,41 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+
+def _draft_groups_aligned(
+    groups: list[KVCacheGroupSpec], draft_specs: dict[str, KVCacheSpec]
+) -> list[KVCacheGroupSpec]:
+    """Append the drafter's layers as their own group(s), page-aligned to the
+    packed groups so physical memory per block stays uniform. One group per
+    distinct draft spec (normally exactly one)."""
+    if not draft_specs or not groups:
+        return []
+    common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
+    group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
+    by_spec: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for name, spec in draft_specs.items():
+        by_spec[spec].append(name)
+    out: list[KVCacheGroupSpec] = []
+    for spec, names in by_spec.items():
+        per_token = max(spec.page_size_bytes // spec.block_size, 1)
+        max_block_size = max(common_page // per_token, 1)
+        new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
+        wasted = common_page - new_bs * per_token
+        logger.info(
+            "Draft KV group (%d layers): block size %d, page alignment wastes "
+            "%d bytes (%.2f%%) per block",
+            len(names), new_bs, wasted, wasted / common_page * 100,
+        )
+        # Pad only when the natural page falls short of the common page: a
+        # padded page disables kernel block splitting in the attention
+        # backends, which a drafter's larger block relies on.
+        if wasted == 0:
+            aligned = replace(spec, block_size=new_bs)
+        else:
+            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
+        out.append(KVCacheGroupSpec(names, aligned))
+    return out
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1946,18 +1981,31 @@ def get_kv_cache_groups(
     hidden_specs = {
         k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
     }
-    filtered_spec = {
+    # A speculative drafter's layers (flagged non_causal_multi_token_decode)
+    # form a small bucket of their own type; letting it take part in the n:1
+    # packing drags group_size down to the drafter's layer count and pads every
+    # other bucket up to a multiple of it (16 target + 48 mamba + 5 draft ->
+    # group_size 5, 6 padding layers of real page memory per block). Handle
+    # them like hidden-state layers: pack the rest, then append the drafter as
+    # its own page-aligned group.
+    draft_specs = {
         k: v
         for k, v in kv_cache_spec.items()
         if not isinstance(v, HiddenStateCacheSpec)
+        and getattr(v, "non_causal_multi_token_decode", False)
     }
-
+    filtered_spec = {
+        k: v
+        for k, v in kv_cache_spec.items()
+        if not isinstance(v, HiddenStateCacheSpec) and k not in draft_specs
+    }
+    if not filtered_spec:
+        filtered_spec, draft_specs = draft_specs, {}
     if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
-        # Block-outermost blocks are strided by the widest group, so hidden
-        # groups need no page alignment.
         packed_groups += [
             KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
         ]
+        packed_groups += _draft_groups_aligned(packed_groups, draft_specs)
         return packed_groups
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
@@ -1991,6 +2039,7 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    groups += _draft_groups_aligned(groups, draft_specs)
     _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
