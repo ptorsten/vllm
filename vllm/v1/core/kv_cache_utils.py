@@ -1909,12 +1909,54 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
-def _draft_groups_aligned(
-    groups: list[KVCacheGroupSpec], draft_specs: dict[str, KVCacheSpec]
+def _hidden_groups_aligned(
+    groups: list[KVCacheGroupSpec], hidden_specs: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
+    """Hidden-state layers as single-layer groups, page-aligned to the packed
+    groups (padding the page where the token count cannot fill it)."""
+    out: list[KVCacheGroupSpec] = []
+    common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
+    group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
+    for name, spec in hidden_specs.items():
+        per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+        max_block_size = max(common_page // per_token, 1)
+        new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
+        wasted_bytes = common_page - new_bs * per_token
+        logger.info(
+            "Using block size %d for hidden-state cache layer %s; "
+            "page alignment wastes %d bytes (%.2f%%) per block",
+            new_bs,
+            name,
+            wasted_bytes,
+            wasted_bytes / common_page * 100,
+        )
+        aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
+        out.append(KVCacheGroupSpec([name], aligned))
+    return out
+
+
+def _draft_group_block_size(
+    draft_spec: KVCacheSpec, common_page: int, granularity: int
+) -> int | None:
+    """Block size at which the drafter's natural page equals ``common_page``
+    exactly, or None if no such kernel-block-aligned size exists. A padded
+    page would disable kernel block splitting in the attention backends, so
+    an exact fit is the only alignment a draft group can take."""
+    per_token = max(draft_spec.page_size_bytes // draft_spec.block_size, 1)
+    if common_page % per_token:
+        return None
+    block_size = common_page // per_token
+    return block_size if block_size % granularity == 0 else None
+
+
+def _draft_groups_aligned(
+    groups: list[KVCacheGroupSpec],
+    draft_specs: dict[str, KVCacheSpec],
+    granularity: int,
+) -> list[KVCacheGroupSpec] | None:
     """Append the drafter's layers as their own group(s), page-aligned to the
-    packed groups so physical memory per block stays uniform. One group per
-    distinct draft spec (normally exactly one)."""
+    packed groups. Returns None when any draft spec cannot be aligned without
+    padding; the caller then keeps the drafter inside the packing."""
     if not draft_specs or not groups:
         return []
     by_spec: dict[KVCacheSpec, list[str]] = defaultdict(list)
@@ -1922,32 +1964,19 @@ def _draft_groups_aligned(
         by_spec[spec].append(name)
     page_sizes = {g.kv_cache_spec.page_size_bytes for g in groups}
     if len(page_sizes) != 1:
-        # Mixed page sizes among the packed groups: nothing to align to.
-        return [KVCacheGroupSpec(names, spec) for spec, names in by_spec.items()]
+        return None
     common_page = page_sizes.pop()
-    group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
     out: list[KVCacheGroupSpec] = []
     for spec, names in by_spec.items():
-        per_token = max(spec.page_size_bytes // spec.block_size, 1)
-        max_block_size = max(common_page // per_token, 1)
-        new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
-        wasted = common_page - new_bs * per_token
+        block_size = _draft_group_block_size(spec, common_page, granularity)
+        if block_size is None:
+            return None
         logger.info(
-            "Draft KV group (%d layers): block size %d, page alignment wastes "
-            "%d bytes (%.2f%%) per block",
+            "Draft KV group (%d layers): block size %d, page-aligned with no padding",
             len(names),
-            new_bs,
-            wasted,
-            wasted / common_page * 100,
+            block_size,
         )
-        # Pad only when the natural page falls short of the common page: a
-        # padded page disables kernel block splitting in the attention
-        # backends, which a drafter's larger block relies on.
-        if wasted == 0:
-            aligned = replace(spec, block_size=new_bs)
-        else:
-            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
-        out.append(KVCacheGroupSpec(names, aligned))
+        out.append(KVCacheGroupSpec(names, replace(spec, block_size=block_size)))
     return out
 
 
@@ -2030,25 +2059,20 @@ def get_kv_cache_groups(
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
-        common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
-        group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
-        for name, spec in hidden_specs.items():
-            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
-            max_block_size = max(common_page // per_token, 1)
-            new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
-            wasted_bytes = common_page - new_bs * per_token
-            logger.info(
-                "Using block size %d for hidden-state cache layer %s; "
-                "page alignment wastes %d bytes (%.2f%%) per block",
-                new_bs,
-                name,
-                wasted_bytes,
-                wasted_bytes / common_page * 100,
-            )
-            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
-            groups.append(KVCacheGroupSpec([name], aligned))
+        groups += _hidden_groups_aligned(groups, hidden_specs)
 
-    groups += _draft_groups_aligned(groups, draft_specs)
+    # Kernel-block granularity a draft block must keep (the configured block).
+    granularity = getattr(vllm_config.cache_config, "block_size", None) or 16
+    draft_groups = _draft_groups_aligned(groups, draft_specs, granularity)
+    if draft_groups is None:
+        # No zero-waste alignment for the drafter: pack it with the rest.
+        groups = _get_kv_cache_groups_uniform_page_size(
+            unify_kv_cache_spec_page_size({**filtered_spec, **draft_specs})
+        )
+        if hidden_specs:
+            groups += _hidden_groups_aligned(groups, hidden_specs)
+    else:
+        groups += draft_groups
     _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
