@@ -669,6 +669,7 @@ class FIDecode:
     """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
 
     wrapper: BatchDecodeWithPagedKVCacheWrapper
+    q_len_per_req: int = 1
 
 
 class FlashInferDecodeKernel(Enum):
@@ -841,7 +842,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # For full cudagraph capture, one `decode_wrapper` for each batch
             # size is needed for FlashInfer.
             self._decode_wrappers_cudagraph: dict[
-                int, BatchDecodeWithPagedKVCacheWrapper
+                tuple[int, int], BatchDecodeWithPagedKVCacheWrapper
             ] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
@@ -896,10 +897,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             group_layers = get_layers_from_vllm_config(
                 vllm_config, Attention, self.layer_names
             )
-            self.is_kvcache_nvfp4 = any(
-                str(layer.kv_cache_dtype).startswith("nvfp4")
-                for layer in group_layers.values()
-            ) if group_layers else self.cache_dtype.startswith("nvfp4")
+            self.is_kvcache_nvfp4 = (
+                any(
+                    str(layer.kv_cache_dtype).startswith("nvfp4")
+                    for layer in group_layers.values()
+                )
+                if group_layers
+                else self.cache_dtype.startswith("nvfp4")
+            )
             self.use_fa2_nvfp4_kv = False
             if self.is_kvcache_nvfp4:
                 if current_platform.is_device_capability_family(120):
@@ -1047,6 +1052,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
             or self.use_dedicated_xqa
+            # The FA2 tensor-core decode kernel takes uniform multi-token
+            # requests (causal within the block) via q_len_per_req, so
+            # speculative verify batches on the nvfp4 route are decodes too.
+            or self.use_fa2_nvfp4_kv
         )
         self._init_reorder_batch_threshold(
             1,
@@ -1253,7 +1262,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             and cache_config is not None
             and cache_config.cache_dtype.startswith("nvfp4")
         ):
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+            return AttentionCGSupport.UNIFORM_BATCH
 
         kv_specs = iter_layer_specs(kv_cache_spec)
         num_qo_heads = vllm_config.model_config.get_num_attention_heads(
@@ -1466,9 +1475,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._mm_prefill_wrapper
 
-    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+    def _get_decode_wrapper(
+        self, batch_size: int, use_cudagraph: bool = False, q_len_per_req: int = 1
+    ):
         if use_cudagraph:
-            decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
+            decode_wrapper = self._decode_wrappers_cudagraph.get(
+                (batch_size, q_len_per_req), None
+            )
         else:
             decode_wrapper = self._decode_wrapper
 
@@ -1505,7 +1518,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
             # save the decode wrapper
             if use_cudagraph:
-                self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
+                self._decode_wrappers_cudagraph[(batch_size, q_len_per_req)] = (
+                    decode_wrapper
+                )
             else:
                 self._decode_wrapper = decode_wrapper
 
@@ -2199,45 +2214,61 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
-                num_input_tokens = num_decode_tokens
-
+                # Uniform multi-token decodes (speculative verify) plan by
+                # request with q_len_per_req; the splitter guarantees uniformity.
+                q_len_per_req = max(num_decode_tokens // max(num_decodes, 1), 1)
                 decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
+                    num_decodes, use_cudagraph, q_len_per_req
                 )
-                # Use the persistent buffer with padding length,
-                # instead of the same address but chunked version
-                # in atten_metadata when using cudagraph.
-                # NVFP4 trtllm kernel only supports FP8 output;
-                # use FP8 o_data_type so the wrapper matches the
-                # FP8 output buffer allocated in forward().
                 o_dtype = (
                     FP8_DTYPE
                     if (self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv)
                     else self.model_config.dtype
                 )
-                fast_plan_decode(
-                    decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
-                    indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
-                    num_qo_heads=self.num_qo_heads * self.dcp_world_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    page_size=self.page_size,
-                    # Disable flashinfer's pos encoding and use vllm's rope.
-                    pos_encoding_mode="NONE",
-                    sm_scale=self.sm_scale,
-                    window_left=self.window_left,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_data_type=self.q_data_type_decode,
-                    kv_data_type=self.kv_cache_dtype,
-                    o_data_type=o_dtype,
-                    fixed_split_size=self.decode_fixed_split_size,
-                    disable_split_kv=self.disable_split_kv,
+                if q_len_per_req == 1:
+                    fast_plan_decode(
+                        decode_wrapper,
+                        indptr_cpu=self.paged_kv_indptr.cpu[: num_decodes + 1],
+                        indices=paged_kv_indices,
+                        last_page_len_cpu=self.paged_kv_last_page_len.cpu[:num_decodes],
+                        num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        page_size=self.page_size,
+                        pos_encoding_mode="NONE",
+                        sm_scale=self.sm_scale,
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type_decode,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
+                        fixed_split_size=self.decode_fixed_split_size,
+                        disable_split_kv=self.disable_split_kv,
+                    )
+                else:
+                    decode_wrapper.plan(
+                        self.paged_kv_indptr.cpu[: num_decodes + 1],
+                        paged_kv_indices,
+                        self.paged_kv_last_page_len.cpu[:num_decodes],
+                        self.num_qo_heads * self.dcp_world_size,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        self.page_size,
+                        pos_encoding_mode="NONE",
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type_decode,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
+                        sm_scale=self.sm_scale,
+                        q_len_per_req=q_len_per_req,
+                        fixed_split_size=self.decode_fixed_split_size,
+                        disable_split_kv=self.disable_split_kv,
+                        non_blocking=True,
+                    )
+                attn_metadata.decode = FIDecode(
+                    wrapper=decode_wrapper, q_len_per_req=q_len_per_req
                 )
-                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -3020,6 +3051,7 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                         kv_cache_sf=kv_cache_sf,
+                        q_len_per_req=attn_metadata.decode.q_len_per_req,
                         sinks=self.sinks,
                     )
                     output[:num_decode_tokens] = self.dcp_combine(
@@ -3036,6 +3068,7 @@ class FlashInferImpl(AttentionImpl):
                         v_scale=layer._v_scale_float,
                         out=out_decode,
                         kv_cache_sf=kv_cache_sf,
+                        q_len_per_req=attn_metadata.decode.q_len_per_req,
                         sinks=self.sinks,
                     )
 
