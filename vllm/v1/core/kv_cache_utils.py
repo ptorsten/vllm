@@ -1934,7 +1934,13 @@ def _draft_groups_aligned(
             "%d bytes (%.2f%%) per block",
             len(names), new_bs, wasted, wasted / common_page * 100,
         )
-        aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
+        # Pad only when the natural page falls short of the common page: a
+        # padded page disables kernel block splitting in the attention
+        # backends, which a drafter's larger block relies on.
+        if wasted == 0:
+            aligned = replace(spec, block_size=new_bs)
+        else:
+            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
         out.append(KVCacheGroupSpec(names, aligned))
     return out
 
