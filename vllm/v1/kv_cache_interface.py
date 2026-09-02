@@ -390,6 +390,12 @@ class AttentionSpec(KVCacheSpec):
     state_content_bytes: int | None = None
     """C in bytes when packed; None means dense K/V content."""
     tokens_per_state: int | Fraction = 1
+    non_causal_multi_token_decode: bool = False
+    """Set on a speculative drafter's layers that decode a whole block of
+    query tokens non-causally (eagle/DFlash). The engine uses it to identify
+    the draft model's KV cache group; without it every group is treated as a
+    draft group and the drafter's layers force layer-count padding on the
+    other groups."""
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
@@ -517,6 +523,9 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -550,7 +559,6 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
     # Marks draft groups that flatten a non-causal query block into decode rows.
-    non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
 
@@ -983,6 +991,9 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
