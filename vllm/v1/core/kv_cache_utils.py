@@ -1909,7 +1909,6 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
-
 def _draft_groups_aligned(
     groups: list[KVCacheGroupSpec], draft_specs: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1918,11 +1917,15 @@ def _draft_groups_aligned(
     distinct draft spec (normally exactly one)."""
     if not draft_specs or not groups:
         return []
-    common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
-    group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
     by_spec: dict[KVCacheSpec, list[str]] = defaultdict(list)
     for name, spec in draft_specs.items():
         by_spec[spec].append(name)
+    page_sizes = {g.kv_cache_spec.page_size_bytes for g in groups}
+    if len(page_sizes) != 1:
+        # Mixed page sizes among the packed groups: nothing to align to.
+        return [KVCacheGroupSpec(names, spec) for spec, names in by_spec.items()]
+    common_page = page_sizes.pop()
+    group_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in groups))
     out: list[KVCacheGroupSpec] = []
     for spec, names in by_spec.items():
         per_token = max(spec.page_size_bytes // spec.block_size, 1)
@@ -1932,7 +1935,10 @@ def _draft_groups_aligned(
         logger.info(
             "Draft KV group (%d layers): block size %d, page alignment wastes "
             "%d bytes (%.2f%%) per block",
-            len(names), new_bs, wasted, wasted / common_page * 100,
+            len(names),
+            new_bs,
+            wasted,
+            wasted / common_page * 100,
         )
         # Pad only when the natural page falls short of the common page: a
         # padded page disables kernel block splitting in the attention
@@ -1943,6 +1949,7 @@ def _draft_groups_aligned(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
         out.append(KVCacheGroupSpec(names, aligned))
     return out
+
 
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
@@ -2001,11 +2008,13 @@ def get_kv_cache_groups(
     }
     if not filtered_spec:
         filtered_spec, draft_specs = draft_specs, {}
-    if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
+    # The packed layout has its own grouping and annotation; keep the drafter
+    # inside it as before and only split it out on the general path below.
+    packed_input = {**filtered_spec, **draft_specs}
+    if packed_groups := _get_packed_kv_cache_groups(vllm_config, packed_input):
         packed_groups += [
             KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
         ]
-        packed_groups += _draft_groups_aligned(packed_groups, draft_specs)
         return packed_groups
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
