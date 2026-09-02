@@ -791,6 +791,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.layer_names = list(layer_names)
         self.cache_config = vllm_config.cache_config
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
@@ -885,14 +886,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.cache_dtype = self.cache_config.cache_dtype
             # cache_config is the runner's (target) config, but this builder may
             # serve a KV group with its own dtype -- a speculative drafter runs
-            # on an fp8 cache while the target is nvfp4. nvfp4 is the only
-            # scheme stored as packed uint8, so the group's storage dtype is the
-            # per-group discriminator; a non-causal drafter on fp8 must not be
-            # routed (or refused) as nvfp4.
-            self.is_kvcache_nvfp4 = (
-                self.cache_dtype.startswith("nvfp4")
-                and self.kv_cache_spec.dtype == torch.uint8
+            # on an fp8 cache while the target is nvfp4, and its non-causal
+            # block attention must not be routed (or refused) as nvfp4.
+            # (fp8 KV is also stored as uint8, so the spec's storage dtype can't
+            # tell the two apart -- ask the group's own Attention layers.)
+            from vllm.config import get_layers_from_vllm_config
+            from vllm.model_executor.layers.attention.attention import Attention
+
+            group_layers = get_layers_from_vllm_config(
+                vllm_config, Attention, self.layer_names
             )
+            self.is_kvcache_nvfp4 = any(
+                str(layer.kv_cache_dtype).startswith("nvfp4")
+                for layer in group_layers.values()
+            ) if group_layers else self.cache_dtype.startswith("nvfp4")
             self.use_fa2_nvfp4_kv = False
             if self.is_kvcache_nvfp4:
                 if current_platform.is_device_capability_family(120):
