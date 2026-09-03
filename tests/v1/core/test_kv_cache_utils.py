@@ -2926,6 +2926,9 @@ def test_unify_page_size_scales_drafter_instead_of_padding_it():
     assert unified["attn"].block_size == 1792
     assert unified["draft"].block_size == 1008
     assert unified["draft"].page_size_padded is None
+    # Mamba's state grid follows the attention block, keeping the scheduler
+    # block (lcm of group blocks) at lcm(1792, 1008) = 16128, not 112896.
+    assert unified["mamba"].block_size == 1792
 
     # bf16 target (1 KiB/token) pre-aligned to 880 / 901120: already a common
     # multiple of 16384 -> unchanged.
@@ -2940,6 +2943,7 @@ def test_unify_page_size_scales_drafter_instead_of_padding_it():
     )
     assert {spec.page_size_bytes for spec in unified.values()} == {901120}
     assert unified["attn"].block_size == 880 and unified["draft"].block_size == 880
+    assert unified["mamba"].block_size == 880
 
 
 def test_unpadded_page_size_includes_per_token_head_scales():

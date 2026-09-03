@@ -1198,7 +1198,21 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = _common_multiple_page_size(kv_cache_spec, max(page_sizes))
+    orig_max_page_size = max(page_sizes)
+    max_page_size = _common_multiple_page_size(kv_cache_spec, orig_max_page_size)
+    # When the unified page grew and attention blocks were re-derived, the Mamba
+    # state grid follows the (largest) attention block; keeping Mamba at its old
+    # block would make the scheduler block -- the lcm of all group blocks --
+    # explode (e.g. 112896). Plain padding (page unchanged) keeps Mamba as is.
+    mamba_block = None
+    if max_page_size > orig_max_page_size:
+        attn_blocks = [
+            max_page_size // max(spec.page_size_bytes // spec.block_size, 1)
+            for spec in kv_cache_spec.values()
+            if isinstance(spec, AttentionSpec)
+            and not isinstance(spec, MLAAttentionSpec)
+        ]
+        mamba_block = max(attn_blocks) if attn_blocks else None
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
@@ -1210,7 +1224,11 @@ def unify_kv_cache_spec_page_size(
             # with the main model's attention page size; it is needed here
             # when another layer (e.g. from a draft model) has a larger page
             # than the already-aligned Mamba page.
-            new_spec: KVCacheSpec = replace(layer_spec, page_size_padded=max_page_size)
+            new_spec: KVCacheSpec = replace(
+                layer_spec,
+                page_size_padded=max_page_size,
+                block_size=mamba_block or layer_spec.block_size,
+            )
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
         else:
