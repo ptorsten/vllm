@@ -1132,6 +1132,36 @@ def _get_kv_cache_groups_uniform_type(
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
 
 
+def _common_multiple_page_size(
+    kv_cache_spec: dict[str, KVCacheSpec], max_page_size: int, max_growth: float = 1.25
+) -> int:
+    """Unified page size: the smallest multiple of every scalable (non-MLA
+    attention) layer's page that is >= ``max_page_size``.
+
+    A layer whose page does not divide the unified page cannot scale its block
+    and is padded instead, which leaves it at its base block: a 16-token page
+    padded to ~900 KB costs 55x per token, and a speculative drafter in that
+    state can outweigh the whole KV pool. Growing the unified page by up to
+    ``max_growth`` (paying that on the non-scalable pages, e.g. Mamba states)
+    lets every attention layer scale cleanly. Falls back to ``max_page_size``
+    when the common multiple would grow it further.
+    """
+    scalable = [
+        spec.page_size_bytes
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec) and not isinstance(spec, MLAAttentionSpec)
+    ]
+    if not scalable:
+        return max_page_size
+    unit = 1
+    for page in scalable:
+        unit = math.lcm(unit, page)
+    target = -(-max_page_size // unit) * unit
+    if target > max_page_size * max_growth:
+        return max_page_size
+    return target
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1161,7 +1191,7 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = max(page_sizes)
+    max_page_size = _common_multiple_page_size(kv_cache_spec, max(page_sizes))
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
