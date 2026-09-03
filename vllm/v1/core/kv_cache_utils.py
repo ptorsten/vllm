@@ -1136,30 +1136,37 @@ def _common_multiple_page_size(
     kv_cache_spec: dict[str, KVCacheSpec], max_page_size: int, max_growth: float = 1.25
 ) -> int:
     """Unified page size: the smallest multiple of every scalable (non-MLA
-    attention) layer's page that is >= ``max_page_size``.
+    attention) layer's per-token unit (bytes per token x its current block,
+    the kernel granularity) that is >= ``max_page_size``.
 
     A layer whose page does not divide the unified page cannot scale its block
     and is padded instead, which leaves it at its base block: a 16-token page
     padded to ~900 KB costs 55x per token, and a speculative drafter in that
     state can outweigh the whole KV pool. Growing the unified page by up to
-    ``max_growth`` (paying that on the non-scalable pages, e.g. Mamba states)
-    lets every attention layer scale cleanly. Falls back to ``max_page_size``
-    when the common multiple would grow it further.
+    ``max_growth`` (paid on the non-scalable pages, e.g. Mamba states) lets
+    every attention layer scale cleanly; blocks are re-derived from bytes per
+    token, so a layer already aligned to a larger page can re-scale too.
     """
-    scalable = [
-        spec.page_size_bytes
-        for spec in kv_cache_spec.values()
-        if isinstance(spec, AttentionSpec) and not isinstance(spec, MLAAttentionSpec)
-    ]
-    if not scalable:
+    units = []
+    for spec in kv_cache_spec.values():
+        if isinstance(spec, AttentionSpec) and not isinstance(spec, MLAAttentionSpec):
+            per_token = max(spec.page_size_bytes // spec.block_size, 1)
+            units.append(per_token * _base_block_size(spec))
+    if not units:
         return max_page_size
     unit = 1
-    for page in scalable:
-        unit = math.lcm(unit, page)
+    for u in units:
+        unit = math.lcm(unit, u)
     target = -(-max_page_size // unit) * unit
     if target > max_page_size * max_growth:
         return max_page_size
     return target
+
+
+def _base_block_size(spec: KVCacheSpec) -> int:
+    """Kernel granularity a scaled block must keep (the configured block size
+    before any page alignment); 16 is vLLM's default block."""
+    return 16 if spec.block_size % 16 == 0 else spec.block_size
 
 
 def unify_kv_cache_spec_page_size(
@@ -1208,10 +1215,19 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
+            per_token = max(layer_page_size // layer_spec.block_size, 1)
             if max_page_size % layer_page_size == 0:
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
+            elif (
+                isinstance(layer_spec, AttentionSpec)
+                and not isinstance(layer_spec, MLAAttentionSpec)
+                and max_page_size % (per_token * _base_block_size(layer_spec)) == 0
+            ):
+                # Re-derive the block from bytes per token (the page is a
+                # multiple of this layer's per-token unit by construction).
+                new_spec = replace(layer_spec, block_size=max_page_size // per_token)
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
