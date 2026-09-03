@@ -3439,6 +3439,53 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
 
 
+def test_unify_page_size_scales_drafter_instead_of_padding_it():
+    """Real geometry from Qwen3.8-27B + DFlash as unify sees it: the platform has
+    already aligned the nvfp4 attention block (576 B/token) to the Mamba page,
+    so attention arrives at block 1568 / page 903168 with Mamba padded to the
+    same; the fp8 drafter arrives at block 16 / page 16384. 903168 is not a
+    multiple of 16384, so the drafter used to be padded at block 16 (55 KiB per
+    token). The unified page grows to lcm(576*16, 1024*16) * 7 = 1032192
+    (+14.3% on Mamba pages): attention re-derives to 1792, drafter to 1008.
+    """
+    mamba = new_mamba_spec(
+        block_size=1568, shapes=((901120 // 4,),), dtypes=(torch.float32,)
+    )
+    mamba = replace(mamba, page_size_padded=903168)
+    attn = new_kv_cache_spec(
+        block_size=1568, num_kv_heads=1, head_size=288, dtype=torch.uint8
+    )
+    draft = new_sliding_window_spec(
+        block_size=16, num_kv_heads=4, head_size=128, dtype=torch.uint8
+    )
+    assert (attn.page_size_bytes, draft.page_size_bytes) == (903168, 16384)
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba": mamba, "attn": attn, "draft": draft}
+    )
+    assert {spec.page_size_bytes for spec in unified.values()} == {1032192}
+    assert unified["attn"].block_size == 1792
+    assert unified["draft"].block_size == 1008
+    assert unified["draft"].page_size_padded is None
+    # Mamba's state grid follows the attention block, keeping the scheduler
+    # block (lcm of group blocks) at lcm(1792, 1008) = 16128, not 112896.
+    assert unified["mamba"].block_size == 1792
+
+    # bf16 target (1 KiB/token) pre-aligned to 880 / 901120: already a common
+    # multiple of 16384 -> unchanged.
+    mamba_bf16 = new_mamba_spec(
+        block_size=880, shapes=((901120 // 4,),), dtypes=(torch.float32,)
+    )
+    attn_bf16 = new_kv_cache_spec(
+        block_size=880, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+    )
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba": mamba_bf16, "attn": attn_bf16, "draft": draft}
+    )
+    assert {spec.page_size_bytes for spec in unified.values()} == {901120}
+    assert unified["attn"].block_size == 880 and unified["draft"].block_size == 880
+    assert unified["mamba"].block_size == 880
+
+
 def test_unpadded_page_size_includes_per_token_head_scales():
     # Per-token-head quant carries inline fp32 scales that are carved from the
     # raw KV allocation, so they must be budgeted into the offload width. The
