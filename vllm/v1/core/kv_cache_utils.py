@@ -2079,7 +2079,12 @@ def get_kv_cache_groups(
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
     try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        # Unify over target and draft layers together so the unified page is a
+        # common multiple of every scalable page (the drafter's included); then
+        # split the drafter back out already scaled to the common page.
+        unified = unify_kv_cache_spec_page_size({**filtered_spec, **draft_specs})
+        draft_specs = {k: unified[k] for k in draft_specs}
+        filtered_spec = {k: v for k, v in unified.items() if k not in draft_specs}
     except NotImplementedError:
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
