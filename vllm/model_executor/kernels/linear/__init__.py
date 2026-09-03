@@ -1087,6 +1087,13 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     possible = list(_POSSIBLE_NVFP4_KERNELS.get(platform, []))
     if use_a16:
         possible = [kernel for kernel in possible if kernel in a16_kernels]
+    else:
+        # Weight-only kernels never quantize the activations. Keep them as the
+        # last resort for W4A4 layers (platforms without a W4A4 kernel) instead
+        # of letting registry order pick one over an available W4A4 kernel.
+        possible = [k for k in possible if k not in a16_kernels] + [
+            k for k in possible if k in a16_kernels
+        ]
 
     # Apply --linear-backend filtering when set.
     possible = _resolve_backend_kernels(possible, "NVFP4")
@@ -1119,6 +1126,14 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                 "\n - ".join(failure_reasons),
             )
 
+        if not use_a16 and kernel_cls in a16_kernels:
+            logger.warning_once(
+                "NVFP4 W4A4 linear layers fall back to the weight-only kernel %s: "
+                "activations are not quantized on this platform (unavailable W4A4 "
+                "kernels:\n - %s\n).",
+                kernel_cls.__name__,
+                "\n - ".join(failure_reasons),
+            )
         logger.info_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
         return kernel_cls(config)
 
