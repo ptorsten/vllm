@@ -1750,8 +1750,34 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     quant_config=self.mxfp8_config,
                     moe_config=layer.moe_config,
                 )
+            if quant_algo == "FP8_BLOCK_SCALES":
+                # DeepSeek-style 128x128 block FP8 routed experts (e.g. the
+                # Qwen3.8-Flash-Next MTP experts): weights ``weight``/
+                # ``weight_scale_inv`` per expert, dynamic per-token-group
+                # activations. vLLM's native block-FP8 MoE method owns this
+                # layout; ModelOptFp8MoEMethod is per-tensor only.
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8MoEMethod,
+                )
+
+                block = self._resolve_group_size(prefix) or 128
+                block_fp8_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    weight_block_size=[block, block],
+                )
+                return Fp8MoEMethod(block_fp8_config, layer)
             return None
 
+        return None
+
+    def _resolve_group_size(self, prefix: str) -> int | None:
+        """Group size recorded for ``prefix`` in ``quantized_layers``, if any."""
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            info = self.quantized_layers.get(candidate)
+            if info is not None and info.get("group_size"):
+                return int(info["group_size"])
         return None
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):

@@ -136,6 +136,20 @@ def _make_draft_vllm_config(
                 "exclude_modules",
                 _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
             )
+        # ModelOpt MIXED_PRECISION names the MTP layer in checkpoint space
+        # (``mtp.layers.0``); the draft builds it at ``mtp.layers.<num_hidden_layers>``.
+        # Mirror the ignored-layer remap so per-layer quant_algo lookups resolve.
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if isinstance(quantized_layers, dict):
+            remapped_layers = dict(quantized_layers)
+            for name, info in quantized_layers.items():
+                if name.startswith("mtp."):
+                    remapped_layers[
+                        _remap_ignored_layers([name], mtp_start_layer_idx)[0]
+                    ] = info
+            setattr(  # noqa: B010
+                draft_quant_config, "quantized_layers", remapped_layers
+            )
 
     draft_vllm_config = replace(
         vllm_config,
