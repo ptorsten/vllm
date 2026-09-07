@@ -886,14 +886,18 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
+        # dflash and extract_hidden_states draft from the target's EAGLE-3
+        # auxiliary hidden states (Qwen4ExpModel.aux_hidden_state_layers).
         if spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
+            "dflash",
+            "extract_hidden_states",
         }:
             raise NotImplementedError(
-                "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "Qwen4Exp speculative decoding supports its native MTP checkpoint, "
+                "linear n-gram proposers, DFlash and hidden-state extraction"
             )
 
 
