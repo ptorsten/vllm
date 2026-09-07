@@ -328,6 +328,10 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         try:
             event.synchronize()
             save_file(tensors, filename)
+            # safetensors writes through a private temp file (mode 0600); the
+            # consumer of these files runs outside the container as another
+            # user, so open them up to the directory's default.
+            os.chmod(filename, 0o644)
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)  # releases LOCK_EX
