@@ -35,6 +35,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -469,9 +470,19 @@ class Qwen4ExpModel(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+        # EAGLE-3 auxiliary outputs (set through
+        # Qwen4ExpForCausalLM.set_aux_hidden_state_layers); id 0 is the
+        # embedding, id i the state after layer i - 1.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def _aux_feature(self, multi_stream: torch.Tensor) -> torch.Tensor:
+        """Per-layer feature of the hyper-connected residual: the hc_count
+        streams of the materialized multi-stream state averaged to [T, H]."""
+        num_tokens = multi_stream.shape[0]
+        return multi_stream.view(num_tokens, self.config.hc_count, -1).mean(dim=1)
 
     def forward(
         self,
@@ -496,6 +507,10 @@ class Qwen4ExpModel(nn.Module):
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
 
+        aux_layers = self.aux_hidden_state_layers
+        aux_hidden_states: list[torch.Tensor] = []
+        if 0 in aux_layers:
+            aux_hidden_states.append(self._aux_feature(hidden_states))
         block_output = None
         injection = None
         last_layer = None
@@ -535,6 +550,17 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if layer_idx + 1 in aux_layers:
+                # Materialize the pending combine for the feature only; the
+                # delayed (hidden_states, block_output, injection) triple
+                # continues unchanged into the next layer.
+                if block_output is None:
+                    materialized = hidden_states
+                else:
+                    materialized = layer.mlp_hyper_connection.combine(
+                        hidden_states, block_output, injection
+                    )
+                aux_hidden_states.append(self._aux_feature(materialized))
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -558,6 +584,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -610,6 +638,7 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
 ):
@@ -684,6 +713,16 @@ class Qwen4ExpForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # The last layer and every tenth layer before it, five in total
+        # (48 layers: 8, 18, 28, 38, 48 = after 0-based layers 7 .. 47), the
+        # spread the Flash-Next DFlash head is trained on.
+        num_layers = len(self.model.layers)
+        return tuple(num_layers - 10 * (4 - i) for i in range(5))
 
     @classmethod
     def get_ple_mamba_state_dtype_from_config(
@@ -985,6 +1024,12 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def forward(
         self,
