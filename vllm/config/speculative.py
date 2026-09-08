@@ -1073,6 +1073,9 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        # --speculative-config JSON delivers nested configs as dicts.
+        if isinstance(self.draft_load_config, dict):
+            self.draft_load_config = LoadConfig(**self.draft_load_config)
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
